@@ -1,17 +1,21 @@
-from conans import ConanFile, ConfigureEnvironment
-import os, codecs, re
-from conans.tools import download, untargz, cpu_count, os_info
+import codecs
+import os
+import re
+
+from conans import ConanFile  # , ConfigureEnvironment
+from conans.tools import cpu_count, download, os_info, untargz, chdir, replace_in_file
+
 
 class LibxmlConan(ConanFile):
     name = "libxml2"
-    version = "2.9.4"
+    version = "2.9.7"
     url = "http://github.com/vitallium/conan-libxml2-qt"
     settings = "os", "compiler", "build_type", "arch"
     options = {"shared": [True, False]}
     default_options = "shared=False"
     src_dir = "libxml2-%s" % version
     license = "https://git.gnome.org/browse/libxml2/tree/Copyright"
-    requires = "icu/59.1@vitallium/stable"
+    requires = "icu/59.1@bincrafters/stable"
 
     def source(self):
         tar_name = "libxml2-%s.tar.gz" % self.version
@@ -61,7 +65,7 @@ class LibxmlConan(ConanFile):
              --without-legacy \
              --without-ftp \
              --without-http \
-             "
+            "
             if self.options.shared:
                 self.configure_options += "--disable-static --enable-shared"
             else:
@@ -76,24 +80,23 @@ class LibxmlConan(ConanFile):
     def build_windows(self):
         # taken from: https://github.com/lasote/conan-libxml2/blob/master/conanfile.py#L38
         icu_headers_paths = self.deps_cpp_info["icu"].include_paths[0]
-        icu_lib_paths= " ".join(['lib="%s"' % lib for lib in self.deps_cpp_info["icu"].lib_paths])
-        icu_libs = self.deps_cpp_info["icu"].libs
+        icu_libs = [lib for lib in self.deps_cpp_info["icu"].libs if lib == "icuuc"]
 
         # use the correct icu libs
         makefile_win_path = os.path.join(self.src_dir, "win32", "Makefile.msvc")
-        encoding = self.detect_by_bom(makefile_win_path, "utf-8")
-        patched_content = self.load(makefile_win_path, encoding)
-        patched_content = re.sub("icu.lib", " ".join("%s.lib"%i for i in icu_libs), patched_content)
-        self.save(makefile_win_path, patched_content)
+        replace_in_file(makefile_win_path, "icu.lib", " ".join("%s.lib" % i for i in icu_libs))
 
-        self.run('cd %s\win32 && cscript configure.js cruntime=/%s include=\"%s\" %s %s' % (
-            self.src_dir,
-            self.settings.compiler.runtime,
-            icu_headers_paths,
-            icu_lib_paths,
-            self.configure_options,
-            ))
-        self.run("cd %s\\win32 && nmake /f Makefile.msvc" % self.src_dir)
+        with chdir("%s\\win32" % self.src_dir):
+            self.run("cscript configure.js cruntime=/%s include=\"%s\" %s" % (
+                self.settings.compiler.runtime,
+                icu_headers_paths,
+                self.configure_options,
+                ))
+
+            # NOTE: Somehow linker does not use LIB variable
+            replace_in_file("Makefile.msvc", "LDFLAGS = $(LDFLAGS) /LIBPATH:$(BINDIR) /LIBPATH:$(LIBPREFIX)", "LDFLAGS = $(LDFLAGS) /LIBPATH:$(BINDIR) /LIBPATH:$(LIBPREFIX) /LIBPATH:\"%s\"" % ";".join(self.deps_cpp_info["icu"].lib_paths))
+
+            self.run("nmake /f Makefile.msvc")
 
     def normalize_prefix_path(self, p):
         if os_info.is_windows:
@@ -102,21 +105,22 @@ class LibxmlConan(ConanFile):
             return p
 
     def build_with_configure(self):
-        env = ConfigureEnvironment(self.deps_cpp_info, self.settings)
-        command_env = env.command_line_env
-        if os_info.is_windows:
-            command_env += " &&"
-            libflags = " ".join(["-l%s" % lib for lib in self.deps_cpp_info.libs])
-            command_env += ' set "LIBS=%s" &&' % libflags
+        pass
+        # env = ConfigureEnvironment(self.deps_cpp_info, self.settings)
+        # command_env = env.command_line_env
+        # if os_info.is_windows:
+        #     command_env += " &&"
+        #     libflags = " ".join(["-l%s" % lib for lib in self.deps_cpp_info.libs])
+        #     command_env += ' set "LIBS=%s" &&' % libflags
 
-        self.run("%s sh %s/configure --prefix=%s %s" % (
-            command_env,
-            self.src_dir,
-            self.normalize_prefix_path(self.package_folder),
-            self.configure_options
-            ))
-        self.run("%s make -j %s" % (command_env, cpu_count()))
-        self.run("%s make install" % command_env)
+        # self.run("%s sh %s/configure --prefix=%s %s" % (
+        #     command_env,
+        #     self.src_dir,
+        #     self.normalize_prefix_path(self.package_folder),
+        #     self.configure_options
+        #     ))
+        # self.run("%s make -j %s" % (command_env, cpu_count()))
+        # self.run("%s make install" % command_env)
 
     def package(self):
         if self.settings.os != "Windows":
@@ -138,7 +142,7 @@ class LibxmlConan(ConanFile):
 
     # from https://github.com/SteffenL/conan-wxwidgets-custom/blob/master/conanfile.py#L260
     def load(self, path, encoding=None):
-        encoding = detect_by_bom(path, "utf-8") if encoding is None else encoding
+        encoding = self.detect_by_bom(path, "utf-8") if encoding is None else encoding
         with codecs.open(path, "rb", encoding=encoding) as f:
             return f.read()
 
@@ -147,12 +151,13 @@ class LibxmlConan(ConanFile):
             f.write(content)
 
     # Ref.: http://stackoverflow.com/a/24370596
-    def detect_by_bom(self,path,default):
+    def detect_by_bom(self, path, default):
         with open(path, 'rb') as f:
             raw = f.read(4)    #will read less if the file is smaller
-        for enc,boms in \
-                ('utf-8-sig',(codecs.BOM_UTF8,)),\
-                ('utf-16',(codecs.BOM_UTF16_LE,codecs.BOM_UTF16_BE)),\
-                ('utf-32',(codecs.BOM_UTF32_LE,codecs.BOM_UTF32_BE)):
-            if any(raw.startswith(bom) for bom in boms): return enc
+        for enc, boms in \
+                ('utf-8-sig', (codecs.BOM_UTF8,)),\
+                ('utf-16', (codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)),\
+                ('utf-32', (codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)):
+            if any(raw.startswith(bom) for bom in boms):
+                return enc
         return default
